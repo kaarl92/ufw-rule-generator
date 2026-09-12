@@ -74,6 +74,9 @@
     color:#06120c; padding:9px 16px; border-radius:8px; font-size:13px; font-weight:600; opacity:0;
     transition:opacity .2s; pointer-events:none; }
   .toast.show { opacity:1; }
+  .validation-errors { display:none; margin:0 0 10px; padding:9px 12px; border:1px solid var(--danger);
+    border-radius:8px; color:var(--danger); background:#2a1719; font-size:12px; white-space:pre-line; }
+  .validation-errors.show { display:block; }
   .muted { color:var(--muted); }
   .sticky { position:sticky; top:18px; }
   .add-svc { display:grid; grid-template-columns:1.2fr 1fr .8fr .8fr 1.3fr auto; gap:8px; align-items:end; margin-top:10px; }
@@ -128,7 +131,7 @@
         <div><label>Kommentar (optional)</label><input type="text" id="csComment" placeholder="Vaultwarden"></div>
         <button class="sm" onclick="addCustomSvc()">+ speichern</button>
       </div>
-      <div class="hint">Eigene Dienste werden im Browser gespeichert (bleiben nach Neustart erhalten). Mehrere Ports? Mit Komma trennen: <code>80,443</code>.</div>
+      <div class="hint">Eigene Dienste werden im Browser gespeichert (bleiben nach Neustart erhalten). Erlaubt sind einzelne Ports oder Bereiche wie <code>50000:50100</code>.</div>
     </div>
 
     <!-- Freie Regeln -->
@@ -163,6 +166,7 @@
           <button class="ghost sm" onclick="downloadScript()">.sh laden</button>
         </div>
       </div>
+      <div class="validation-errors" id="validationErrors" role="alert"></div>
       <pre id="output"></pre>
     </div>
   </div>
@@ -276,7 +280,11 @@ let customSvc = Array.isArray(storedCustomSvc)
   ? storedCustomSvc.filter(isValidService)
   : [];                                    // [{id,cat,name,ports:[[port,proto,desc]]}]
 let activeSvc = new Set(load(LS.active, []));
+let customSvc = load(LS.custom, []);      // [{id,cat,name,ports:[[port,proto,desc]]}]
+const storedActiveSvc = load(LS.active, []);
+let activeSvc = new Set(Array.isArray(storedActiveSvc) ? storedActiveSvc : []);
 let customRules = [];
+let loadWarnings = [];
 
 function allServices(){ return BASE_SERVICES.concat(customSvc); }
 
@@ -293,7 +301,8 @@ function renderNets(){
 function addNet(){
   const name=document.getElementById('netName').value.trim();
   const cidr=document.getElementById('netCidr').value.trim();
-  if(!cidr){ toast('CIDR/IP fehlt'); return; }
+  const error=validateNetwork(cidr, false);
+  if(error){ toast(`Netz nicht gespeichert: ${error}`); return; }
   nets.push({name,cidr,active:true});
   document.getElementById('netName').value=''; document.getElementById('netCidr').value='';
   save(LS.nets,nets); renderNets(); gen();
@@ -373,7 +382,9 @@ function addCustomSvc(){
   const cat=document.getElementById('csCat').value;
   const comment=document.getElementById('csComment').value.trim()||name;
   if(!name||!portRaw){ toast('Name + Port nötig'); return; }
-  const ports=portRaw.split(',').map(p=>p.trim()).filter(Boolean).map(p=>[p,proto,comment]);
+  const error=validateRuleValues('',portRaw,proto,comment);
+  if(error){ toast(`Dienst nicht gespeichert: ${error}`); return; }
+  const ports=[[portRaw,proto,comment]];
   const id='cs_'+Date.now();
   customSvc.push({id,cat,name,ports});
   save(LS.custom,customSvc);
@@ -415,7 +426,7 @@ function delR(i){ customRules.splice(i,1); renderRules(); gen(); }
 // dir: 'in' (klassisch, ohne Keyword) | 'in!' (explizit in) | 'out'
 function ruleLine(dir,node,port,proto,comment){
   const protoPart=(proto&&proto!=='any')?` proto ${proto}`:'';
-  const cm=comment?` comment '${comment}'`:'';
+  const cm=comment?` comment ${shellQuote(comment)}`:'';
   if(dir==='out'){
     const to=node?`to ${node} `:'to any ';
     return `sudo ufw allow out ${to}port ${port}${protoPart}${cm}`;
@@ -442,7 +453,7 @@ function gen(){
   saveOpts();
   const svcDir=document.getElementById('svcDir').value; // in | out | both
   const activeNets=nets.filter(n=>n.active);
-  const L=[]; let ruleN=0;
+  const L=[]; const errors=[...loadWarnings]; let ruleN=0;
   if(o.reset){ L.push('# Sauberer Neustart (bei Bedarf einkommentieren):','# sudo ufw --force reset',''); }
   if(o.logging){ L.push('sudo ufw logging on'); }
 
@@ -450,11 +461,12 @@ function gen(){
   // Reihenfolge: Basis-Katalog, dann eigene
   allServices().forEach(s=>{
     if(!activeSvc.has(s.id)) return;
-    if(o.comments) L.push(`# ${s.name}`);
+    if(o.comments) L.push(`# ${String(s.name).replace(/[\r\n]/g,' ')}`);
     s.ports.forEach(([port,proto,desc])=>{
       dirs.forEach(d=>{
-        if(activeNets.length===0){ L.push(ruleLine(d,'',port,proto,desc)); ruleN++; }
-        else activeNets.forEach(n=>{ const cm=n.name?`${desc} ${n.name}`:desc; L.push(ruleLine(d,n.cidr,port,proto,cm)); ruleN++; });
+        if(activeNets.length===0){ appendRule(L,errors,d,'',port,proto,desc,`Dienst „${s.name}“`) && ruleN++; }
+        else activeNets.forEach(n=>{ const cm=n.name?`${desc} ${n.name}`:desc;
+          appendRule(L,errors,d,n.cidr,port,proto,cm,`Dienst „${s.name}“, Netz „${n.name||n.cidr}“`) && ruleN++; });
       });
     });
   });
@@ -464,7 +476,7 @@ function gen(){
     if(o.comments) L.push('# Einmalige Regeln');
     validRules.forEach(r=>{
       dirsFor(r.dir||'in',o.explicit).forEach(d=>{
-        L.push(ruleLine(d,r.src.trim(),r.port.trim(),r.proto,r.comment.trim())); ruleN++;
+        appendRule(L,errors,d,r.src.trim(),r.port.trim(),r.proto,r.comment.trim(),`Einmalige Regel ${customRules.indexOf(r)+1}`) && ruleN++;
       });
     });
   }
@@ -473,6 +485,7 @@ function gen(){
   const out=L.join('\n').trim();
   document.getElementById('output').textContent = out || '# Noch nichts ausgewählt …';
   document.getElementById('ruleCount').textContent = ruleN?`(${ruleN} Regeln)`:'';
+  showValidationErrors(errors);
 }
 
 // ---------- Output ----------
@@ -481,7 +494,53 @@ function scriptText(withShebang){
   return withShebang ? `#!/usr/bin/env bash\nset -euo pipefail\n\n${body}\n` : body;
 }
 function copyScript(){
-  navigator.clipboard.writeText(scriptText(false)).then(()=>toast('Kopiert'),()=>toast('Kopieren fehlgeschlagen'));
+  const text=scriptText(false);
+  const copied=()=>toast('Kopiert');
+  const failed=()=>toast('Kopieren fehlgeschlagen');
+
+  try {
+    const clipboard=navigator.clipboard;
+    if(typeof clipboard?.writeText==='function'){
+      Promise.resolve(clipboard.writeText(text)).then(copied).catch(failed);
+      return;
+    }
+
+    const active=document.activeElement;
+    const inputSelection=active && typeof active.selectionStart==='number'
+      ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
+    const selection=window.getSelection?.();
+    const ranges=[];
+    if(selection){
+      for(let i=0;i<selection.rangeCount;i++) ranges.push(selection.getRangeAt(i).cloneRange());
+    }
+    const textarea=document.createElement('textarea');
+    textarea.value=text;
+    textarea.setAttribute('readonly','');
+    textarea.style.cssText='position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+
+    let success=false;
+    try {
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      success=document.execCommand('copy');
+    } finally {
+      textarea.remove();
+      try { active?.focus({preventScroll:true}); } catch (_) { try { active?.focus(); } catch (_) {} }
+      if(inputSelection){
+        try { active.setSelectionRange(...inputSelection); } catch (_) {}
+      }
+      if(selection){
+        try {
+          selection.removeAllRanges();
+          ranges.forEach(range=>selection.addRange(range));
+        } catch (_) {}
+      }
+    }
+    success ? copied() : failed();
+  } catch (_) {
+    failed();
+  }
 }
 function downloadScript(){
   const blob=new Blob([scriptText(opt('optShebang'))],{type:'text/x-shellscript'});
@@ -490,6 +549,67 @@ function downloadScript(){
 }
 
 // ---------- Helpers ----------
+function validatePort(value){
+  if(typeof value!=='string' || !/^\d+(?::\d+)?$/.test(value)) return 'Port muss eine Zahl oder ein Bereich wie 50000:50100 sein';
+  const bounds=value.split(':').map(Number);
+  if(bounds.some(n=>!Number.isInteger(n)||n<1||n>65535)) return 'Portgrenzen müssen zwischen 1 und 65535 liegen';
+  if(bounds.length===2 && bounds[0]>bounds[1]) return 'die erste Portgrenze darf nicht größer als die zweite sein';
+  return '';
+}
+function validIPv4(value){
+  const p=value.split('.');
+  return p.length===4 && p.every(x=>/^(0|[1-9]\d{0,2})$/.test(x) && Number(x)<=255);
+}
+function validIPv6(value){
+  if(!/^[0-9A-Fa-f:.]+$/.test(value) || (value.match(/::/g)||[]).length>1) return false;
+  let v=value;
+  const last=v.substring(v.lastIndexOf(':')+1);
+  if(last.includes('.')) {
+    if(!validIPv4(last)) return false;
+    v=v.slice(0,v.lastIndexOf(':'))+':v4:v4';
+  }
+  const compressed=v.includes('::');
+  const groups=v.split(':').filter(Boolean);
+  return groups.every(x=>x==='v4'||/^[0-9A-Fa-f]{1,4}$/.test(x)) && (compressed ? groups.length<8 : groups.length===8);
+}
+function validateNetwork(value, allowEmpty=true){
+  if(value==='' && allowEmpty) return '';
+  if(typeof value!=='string' || value==='' || /\s/.test(value)) return 'IP/CIDR darf nicht leer sein oder Leerzeichen enthalten';
+  const parts=value.split('/');
+  if(parts.length>2 || !parts[0]) return 'ungültige IPv4-, IPv6- oder CIDR-Angabe';
+  const ipv4=validIPv4(parts[0]), ipv6=!ipv4&&validIPv6(parts[0]);
+  if(!ipv4&&!ipv6) return 'ungültige IPv4-, IPv6- oder CIDR-Angabe';
+  if(parts.length===2 && (!/^\d+$/.test(parts[1]) || Number(parts[1])>(ipv4?32:128))) return `CIDR-Präfix muss zwischen 0 und ${ipv4?32:128} liegen`;
+  return '';
+}
+function validateRuleValues(node,port,proto,comment){
+  return validateNetwork(node,true) || validatePort(port) ||
+    (!['tcp','udp','any'].includes(proto) ? 'Protokoll muss tcp, udp oder any sein' : '') ||
+    (typeof comment!=='string' ? 'Kommentar muss Text sein' : '');
+}
+function shellQuote(value){ return `'${String(value).replace(/'/g, `'"'"'`)}'`; }
+function appendRule(lines,errors,dir,node,port,proto,comment,label){
+  const error=validateRuleValues(node,port,proto,comment);
+  if(error){ errors.push(`${label}: ${error}.`); return false; }
+  lines.push(ruleLine(dir,node,port,proto,comment)); return true;
+}
+function showValidationErrors(errors){
+  const el=document.getElementById('validationErrors');
+  el.textContent=errors.length?`Ungültige Eingaben – betroffene Regeln wurden nicht erzeugt:\n${[...new Set(errors)].map(e=>`• ${e}`).join('\n')}`:'';
+  el.classList.toggle('show',errors.length>0);
+}
+function sanitizeStoredData(){
+  if(!Array.isArray(nets)){ loadWarnings.push('Gespeicherte Netzprofile hatten ein ungültiges Format und wurden entfernt.'); nets=[]; }
+  else nets=nets.filter((n,i)=>{ const ok=n&&typeof n.name==='string'&&typeof n.cidr==='string'&&!validateNetwork(n.cidr,false);
+    if(!ok) loadWarnings.push(`Gespeichertes Netzprofil ${i+1} war ungültig und wurde entfernt.`); return ok; });
+  if(!Array.isArray(customSvc)){ loadWarnings.push('Gespeicherte eigene Dienste hatten ein ungültiges Format und wurden entfernt.'); customSvc=[]; }
+  else customSvc=customSvc.filter((s,i)=>{ const ok=s&&typeof s.id==='string'&&/^cs_\d+$/.test(s.id)&&typeof s.name==='string'&&CATS.includes(s.cat)&&Array.isArray(s.ports)&&s.ports.length>0&&
+      s.ports.every(p=>Array.isArray(p)&&p.length>=3&&!validateRuleValues('',p[0],p[1],p[2]));
+    if(!ok) loadWarnings.push(`Gespeicherter eigener Dienst ${i+1} war ungültig und wurde entfernt.`); return ok; });
+  if(!(activeSvc instanceof Set)) activeSvc=new Set();
+  activeSvc=new Set([...activeSvc].filter(id=>typeof id==='string'&&allServices().some(s=>s.id===id)));
+  save(LS.nets,nets); save(LS.custom,customSvc); save(LS.active,[...activeSvc]);
+}
 function escapeHtml(s){ return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 function escapeAttr(s){ return escapeHtml(s).replace(/'/g,'&#39;'); }
 let toastTimer;
@@ -498,6 +618,7 @@ function toast(m){ const e=document.getElementById('toast'); e.textContent=m; e.
 
 // ---------- Init ----------
 (function init(){
+  sanitizeStoredData();
   document.getElementById('csCat').innerHTML=CATS.map(c=>`<option ${c==='Eigene Dienste'?'selected':''}>${c}</option>`).join('');
   const so=load(LS.opts,null);
   if(so){ document.getElementById('optLogging').checked=so.logging;
