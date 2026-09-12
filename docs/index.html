@@ -264,7 +264,17 @@ function load(k,def){ try { const v=localStorage.getItem(k); return v?JSON.parse
 function save(k,v){ try { localStorage.setItem(k,JSON.stringify(v)); } catch(e){} }
 
 let nets = load(LS.nets, []);
-let customSvc = load(LS.custom, []);      // [{id,cat,name,ports:[[port,proto,desc]]}]
+function isValidService(service){
+  return service && typeof service==='object' &&
+    ['id','cat','name'].every(field=>typeof service[field]==='string') &&
+    Array.isArray(service.ports) && service.ports.every(port=>
+      Array.isArray(port) && port.length>=3 &&
+      port.slice(0,3).every(field=>typeof field==='string'));
+}
+const storedCustomSvc = load(LS.custom, []);
+let customSvc = Array.isArray(storedCustomSvc)
+  ? storedCustomSvc.filter(isValidService)
+  : [];                                    // [{id,cat,name,ports:[[port,proto,desc]]}]
 let activeSvc = new Set(load(LS.active, []));
 let customRules = [];
 
@@ -300,20 +310,50 @@ function renderSvc(){
     return s.ports.some(p=>String(p[0]).includes(q)||p[2].toLowerCase().includes(q));
   });
   const el = document.getElementById('svcGrid');
-  el.innerHTML = CATS.map(cat=>{
+  const content = document.createDocumentFragment();
+  CATS.forEach(cat=>{
     const items = list.filter(s=>s.cat===cat);
-    if(!items.length) return '';
-    const cards = items.map(s=>{
+    if(!items.length) return;
+
+    const heading = document.createElement('div');
+    heading.className = 'svc-cat';
+    heading.textContent = cat;
+    content.appendChild(heading);
+
+    const grid = document.createElement('div');
+    grid.className = 'svc-grid';
+    items.forEach(s=>{
       const portText=s.ports.map(p=>p[0]).join(', ');
       const isCustom=customSvc.some(c=>c.id===s.id);
-      return `<label class="svc ${activeSvc.has(s.id)?'active':''} ${isCustom?'custom':''}" onclick="toggleSvc('${s.id}',event)">
-        <input type="checkbox" ${activeSvc.has(s.id)?'checked':''}>
-        <span>${escapeHtml(s.name)}<small>${portText}</small></span>
-        ${isCustom?`<span class="del" title="löschen" onclick="delCustomSvc('${s.id}',event)">🗑</span>`:''}
-      </label>`;
-    }).join('');
-    return `<div class="svc-cat">${cat}</div><div class="svc-grid">${cards}</div>`;
-  }).join('');
+      const card = document.createElement('label');
+      card.className = `svc${activeSvc.has(s.id)?' active':''}${isCustom?' custom':''}`;
+      card.addEventListener('click',event=>toggleSvc(s.id,event));
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = activeSvc.has(s.id);
+      card.appendChild(checkbox);
+
+      const details = document.createElement('span');
+      details.textContent = s.name;
+      const ports = document.createElement('small');
+      ports.textContent = portText;
+      details.appendChild(ports);
+      card.appendChild(details);
+
+      if(isCustom){
+        const remove = document.createElement('span');
+        remove.className = 'del';
+        remove.title = 'löschen';
+        remove.textContent = '🗑';
+        remove.addEventListener('click',event=>delCustomSvc(s.id,event));
+        card.appendChild(remove);
+      }
+      grid.appendChild(card);
+    });
+    content.appendChild(grid);
+  });
+  el.replaceChildren(content);
   const total=allServices().length, on=activeSvc.size;
   document.getElementById('svcCount').textContent=`${on} aktiv / ${total}`;
 }
