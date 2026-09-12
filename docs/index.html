@@ -441,7 +441,53 @@ function scriptText(withShebang){
   return withShebang ? `#!/usr/bin/env bash\nset -euo pipefail\n\n${body}\n` : body;
 }
 function copyScript(){
-  navigator.clipboard.writeText(scriptText(false)).then(()=>toast('Kopiert'),()=>toast('Kopieren fehlgeschlagen'));
+  const text=scriptText(false);
+  const copied=()=>toast('Kopiert');
+  const failed=()=>toast('Kopieren fehlgeschlagen');
+
+  try {
+    const clipboard=navigator.clipboard;
+    if(typeof clipboard?.writeText==='function'){
+      Promise.resolve(clipboard.writeText(text)).then(copied).catch(failed);
+      return;
+    }
+
+    const active=document.activeElement;
+    const inputSelection=active && typeof active.selectionStart==='number'
+      ? [active.selectionStart,active.selectionEnd,active.selectionDirection] : null;
+    const selection=window.getSelection?.();
+    const ranges=[];
+    if(selection){
+      for(let i=0;i<selection.rangeCount;i++) ranges.push(selection.getRangeAt(i).cloneRange());
+    }
+    const textarea=document.createElement('textarea');
+    textarea.value=text;
+    textarea.setAttribute('readonly','');
+    textarea.style.cssText='position:fixed;top:0;left:0;opacity:0;pointer-events:none';
+
+    let success=false;
+    try {
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      success=document.execCommand('copy');
+    } finally {
+      textarea.remove();
+      try { active?.focus({preventScroll:true}); } catch (_) { try { active?.focus(); } catch (_) {} }
+      if(inputSelection){
+        try { active.setSelectionRange(...inputSelection); } catch (_) {}
+      }
+      if(selection){
+        try {
+          selection.removeAllRanges();
+          ranges.forEach(range=>selection.addRange(range));
+        } catch (_) {}
+      }
+    }
+    success ? copied() : failed();
+  } catch (_) {
+    failed();
+  }
 }
 function downloadScript(){
   const blob=new Blob([scriptText(opt('optShebang'))],{type:'text/x-shellscript'});
